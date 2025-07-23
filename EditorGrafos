@@ -1,0 +1,795 @@
+package com.example.editorgrafos;
+import javafx.application.Application;
+import javafx.beans.property.SimpleStringProperty;
+import javafx.geometry.Point2D;
+import javafx.scene.Scene;
+import javafx.scene.control.*;
+import javafx.scene.input.KeyCode;
+import javafx.scene.input.KeyCodeCombination;
+import javafx.scene.input.KeyCombination;
+import javafx.scene.layout.*;
+import javafx.scene.paint.Color;
+import javafx.scene.shape.*;
+import javafx.scene.text.Font;
+import javafx.scene.text.FontWeight;
+import javafx.scene.text.Text;
+import javafx.stage.FileChooser;
+import javafx.stage.Stage;
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.util.*;
+import java.util.stream.Collectors;
+public class HelloApplication extends Application {
+    private List<Node> nodes = new ArrayList<>();
+    private List<EdgeGraphic> edgeGraphics = new ArrayList<>();
+    private Pane graphPane = new Pane();
+    private TableView<Map<String, String>> adjacencyMatrix = new TableView<>();
+    private int nodeCounter = 0;
+    private Node selectedNode1 = null;
+    private Node selectedNode2 = null;
+    private Stack<Action> undoStack = new Stack<>();
+    private HelloApplication app;
+    @Override
+    public void start(Stage primaryStage) {
+        this.app = this;
+        BorderPane root = new BorderPane();
+        ToolBar toolBar = new ToolBar(
+                createButton("Adicionar Nó", e -> executeAction(new AddNodeAction(this, addNodeInternal()))),
+                createButton("Rotular Nó", e -> {
+                    if (!nodes.isEmpty()) {
+                        showAlert("Rotular Nó", "Clique duas vezes em um nó para alterar seu rótulo.");
+                    } else {
+                        showAlert("Aviso", "Não há nós para rotular. Adicione um nó primeiro.");
+                    }
+                }),
+                createButton("Criar Aresta", e -> showAlert("Criar Aresta", "Clique em dois nós para criar uma aresta entre eles. O peso será solicitado.")),
+                createButton("Gerar Matriz", e -> displayAdjacencyMatrix()),
+                createButton("Desenhar de Matriz", e -> promptForMatrixInput()),
+                createButton("Encontrar Caminhos", e -> findPathsOptionsPrompt()),
+                createButton("Inverter Aresta", e -> promptToToggleEdgeDirection())
+        );
+        Button singleUndoButton = createButton("Desfazer (Ctrl+Z)", e -> undoLastAction());
+        toolBar.getItems().add(singleUndoButton);
+        Button saveButton = createButton("Salvar Grafo", e -> saveToFile(primaryStage));
+        Button loadButton = createButton("Carregar Grafo", e -> loadFromFile(primaryStage));
+        Button deleteSelectedButton = createButton("Excluir Selecionado", e -> {
+            if (selectedNode1 != null) {
+                List<EdgeData> affectedEdgesData = edgeGraphics.stream()
+                        .filter(edgeGraphic -> edgeGraphic.getEdgeData().getSourceNode() == selectedNode1 || edgeGraphic.getEdgeData().getTargetNode() == selectedNode1)
+                        .map(EdgeGraphic::getEdgeData)
+                        .collect(Collectors.toList());
+                executeAction(new DeleteNodeAction(this, selectedNode1, affectedEdgesData));
+                resetNodeSelection();
+            } else {
+                showAlert("Excluir", "Nenhum nó selecionado para exclusão.");
+            }
+        });
+        Button listNodesButton = createButton("Listar Nós", e -> listNodes());
+        Button deleteAllButton = createButton("Excluir Tudo", e -> {
+            if (confirmAction("Excluir Tudo", "Tem certeza que deseja excluir TODOS os nós e arestas do grafo?")) {
+                List<Node> nodesSnapshot = new ArrayList<>(nodes);
+                List<EdgeData> edgesDataSnapshot = edgeGraphics.stream().map(EdgeGraphic::getEdgeData).collect(Collectors.toList());
+                executeAction(new DeleteAllAction(this, nodesSnapshot, edgesDataSnapshot));
+            }
+        });
+        toolBar.getItems().addAll(saveButton, loadButton, deleteSelectedButton, listNodesButton, deleteAllButton);
+        root.setTop(toolBar);
+        root.setCenter(graphPane);
+        root.setRight(adjacencyMatrix);
+        Scene scene = new Scene(root, 1200, 800);
+        KeyCombination ctrlZ = new KeyCodeCombination(KeyCode.Z, KeyCombination.SHORTCUT_DOWN);
+        scene.setOnKeyPressed(event -> {
+            if (ctrlZ.match(event)) {
+                undoLastAction();
+                event.consume();
+            }
+        });
+        primaryStage.setScene(scene);
+        primaryStage.setTitle("Editor de Grafos");
+        primaryStage.show();
+        setupGraphPaneEventHandlers();
+        initializeAdjacencyMatrixTable();
+    }
+    private Button createButton(String text, javafx.event.EventHandler<javafx.event.ActionEvent> handler) {
+        Button button = new Button(text);
+        button.setOnAction(handler);
+        return button;
+    }
+    class Node extends Circle {
+        String id;
+        Text label;
+        public Node(double x, double y, String id) {
+            super(x, y, 20, Color.BLUE);
+            this.id = id;
+            this.label = new Text(x - 10, y - 25, id);
+            this.label.setFill(Color.BLACK);
+            setOnMouseDragged(e -> {
+                setCenterX(e.getX());
+                setCenterY(e.getY());
+                label.setX(e.getX() - 10);
+                label.setY(e.getY() - 25);
+                app.updateAffectedEdges(this);
+            });
+            setOnMouseClicked(e -> {
+                if (e.getClickCount() == 2) {
+                    promptForNodeLabel(this);
+                } else if (e.getClickCount() == 1) {
+                    if (selectedNode1 == null) {
+                        selectedNode1 = this;
+                        selectedNode1.setFill(Color.RED);
+                    } else if (selectedNode2 == null && Node.this != selectedNode1) {
+                        selectedNode2 = this;
+                        Node.this.setFill(Color.RED);
+                        promptForNewEdgeWeight(selectedNode1, selectedNode2);
+                    } else {
+                        resetNodeSelection();
+                        selectedNode1 = this;
+                        selectedNode1.setFill(Color.RED);
+                    }
+                }
+            });
+            setOnContextMenuRequested(e -> {
+                new NodeContextMenu(this).show(graphPane, e.getScreenX(), e.getScreenY());
+                e.consume();
+            });
+        }
+    }
+    class EdgeData {
+        private Node sourceNode;
+        private Node targetNode;
+        private int weight;
+        private boolean isCurved;
+        private boolean isBidirectionalStraight;
+        private boolean isBidirectionalParallel;
+        public EdgeData(Node sourceNode, Node targetNode, int weight, boolean isCurved, boolean isBidirectionalStraight, boolean isBidirectionalParallel) {
+            this.sourceNode = sourceNode;
+            this.targetNode = targetNode;
+            this.weight = weight;
+            this.isCurved = isCurved;
+            this.isBidirectionalStraight = isBidirectionalStraight;
+            this.isBidirectionalParallel = isBidirectionalParallel;
+        }
+        public EdgeData(Node sourceNode, Node targetNode, int weight) {
+            this(sourceNode, targetNode, weight, false, false, false);
+        }
+        public EdgeData(EdgeData other) {
+            this(other.sourceNode, other.targetNode, other.weight, other.isCurved, other.isBidirectionalStraight, other.isBidirectionalParallel);
+        }
+        public Node getSourceNode() { return sourceNode; }
+        public Node getTargetNode() { return targetNode; }
+        public int getWeight() { return weight; }
+        public boolean isCurved() { return isCurved; }
+        public boolean isBidirectionalStraight() { return isBidirectionalStraight; }
+        public boolean isBidirectionalParallel() { return isBidirectionalParallel; }
+        public void setSourceNode(Node sourceNode) { this.sourceNode = sourceNode; }
+        public void setTargetNode(Node targetNode) { this.targetNode = targetNode; }
+        public void setWeight(int weight) { this.weight = weight; }
+        public void setIsCurved(boolean curved) { isCurved = curved; }
+        public void setIsBidirectionalStraight(boolean bidirectionalStraight) { isBidirectionalStraight = bidirectionalStraight; }
+        public void setIsBidirectionalParallel(boolean bidirectionalParallel) { isBidirectionalParallel = bidirectionalParallel; }
+    }
+    class EdgeGraphic {
+        private EdgeData edgeData;
+        private HelloApplication app;
+        private Text weightLabel;
+        private Shape lineShape;
+        private Polygon arrowHead;
+        private Shape reverseLineShape;
+        private Text reverseWeightLabel;
+        private Polygon reverseArrowHead;
+        public EdgeGraphic(EdgeData edgeData, HelloApplication app) {
+            this.edgeData = edgeData;
+            this.app = app;
+            initializeShapes();
+            setupEventHandlers();
+            updateGraphics();
+        }
+        public EdgeGraphic(EdgeData newEdgeData, RedirectEdgeAction redirectEdgeAction) {
+            this(newEdgeData, redirectEdgeAction.app);
+        }
+        public EdgeData getEdgeData() {
+            return edgeData;
+        }
+        private void initializeShapes() {
+            lineShape = null;
+            weightLabel = null;
+            arrowHead = null;
+            reverseLineShape = null;
+            reverseWeightLabel = null;
+            reverseArrowHead = null;
+            if (edgeData.isCurved() && edgeData.getSourceNode() == edgeData.getTargetNode()) {
+                lineShape = new QuadCurve();
+                weightLabel = new Text(String.valueOf(edgeData.getWeight()));
+            } else if (edgeData.isCurved()) {
+                lineShape = new QuadCurve();
+                weightLabel = new Text(String.valueOf(edgeData.getWeight()));
+                arrowHead = new Polygon();
+            } else {
+                lineShape = new Line();
+                weightLabel = new Text(String.valueOf(edgeData.getWeight()));
+                arrowHead = new Polygon();
+            }
+            lineShape.setStroke(Color.BLACK);
+            lineShape.setStrokeWidth(2);
+            this.weightLabel.setFill(Color.BLACK);
+            this.weightLabel.setFont(Font.font("Arial", FontWeight.BOLD, 14));
+            if (edgeData.isBidirectionalParallel()) {
+                reverseLineShape = new Line();
+                reverseLineShape.setStroke(Color.BLACK);
+                reverseLineShape.setStrokeWidth(2);
+                this.reverseWeightLabel = new Text();
+                this.reverseWeightLabel.setFill(Color.BLACK);
+                this.reverseWeightLabel.setFont(Font.font("Arial", FontWeight.BOLD, 14));
+                reverseArrowHead = new Polygon();
+            } else if (edgeData.isBidirectionalStraight()) {
+                reverseArrowHead = new Polygon();
+            }
+        }
+        public void addComponentsToPane(Pane pane) {
+            if (lineShape != null && !pane.getChildren().contains(lineShape)) pane.getChildren().add(lineShape);
+            if (weightLabel != null && !pane.getChildren().contains(weightLabel)) pane.getChildren().add(weightLabel);
+            if (arrowHead != null && !pane.getChildren().contains(arrowHead)) pane.getChildren().add(arrowHead);
+            if (reverseLineShape != null && !pane.getChildren().contains(reverseLineShape)) pane.getChildren().add(reverseLineShape);
+            if (reverseWeightLabel != null && !pane.getChildren().contains(reverseWeightLabel)) pane.getChildren().add(reverseWeightLabel);
+            if (reverseArrowHead != null && !pane.getChildren().contains(reverseArrowHead)) pane.getChildren().add(reverseArrowHead);
+            updateGraphics();
+            if (weightLabel != null) weightLabel.toFront();
+            if (reverseWeightLabel != null) reverseWeightLabel.toFront();
+            if (arrowHead != null) arrowHead.toFront();
+            if (reverseArrowHead != null) reverseArrowHead.toFront();
+        }
+        public void removeComponentsFromPane(Pane pane) {
+            pane.getChildren().removeAll(lineShape, weightLabel, arrowHead,
+                    reverseLineShape, reverseWeightLabel, reverseArrowHead);
+        }
+        public void updateGraphics() {
+            Node sourceNode = edgeData.getSourceNode();
+            Node targetNode = edgeData.getTargetNode();
+            if (sourceNode == null || targetNode == null) {
+                return;
+            }
+            double startX = sourceNode.getCenterX();
+            double startY = sourceNode.getCenterY();
+            double endX = targetNode.getCenterX();
+            double endY = targetNode.getCenterY();
+            double angle = Math.atan2(endY - startY, endX - startX);
+            double sourceRadius = sourceNode.getRadius();
+            double targetRadius = targetNode.getRadius();
+            double adjustedStartX = startX + sourceRadius * Math.cos(angle);
+            double adjustedStartY = startY + sourceRadius * Math.sin(angle);
+            double adjustedEndX = endX - targetRadius * Math.cos(angle);
+            double adjustedEndY = endY - targetRadius * Math.sin(angle);
+            if (edgeData.isCurved() && sourceNode == targetNode) {
+                QuadCurve curve = (QuadCurve) lineShape;
+                double loopRadius = 30;
+                double angleOffset = Math.PI / 6;
+                double startLoopX = startX + sourceRadius * Math.cos(-Math.PI / 2 + angleOffset);
+                double startLoopY = startY + sourceRadius * Math.sin(-Math.PI / 2 + angleOffset);
+                double endLoopX = endX + targetRadius * Math.cos(-Math.PI / 2 - angleOffset);
+                double endLoopY = endY + targetRadius * Math.sin(-Math.PI / 2 - angleOffset);
+                curve.setStartX(startLoopX);
+                curve.setStartY(startLoopY);
+                curve.setEndX(endLoopX);
+                curve.setEndY(endLoopY);
+                double controlX = startX + loopRadius * Math.cos(Math.PI / 2);
+                double controlY = startY - loopRadius * Math.sin(Math.PI / 2) - 20;
+                curve.setControlX(controlX);
+                curve.setControlY(controlY);
+                weightLabel.setText(String.valueOf(edgeData.getWeight()));
+                weightLabel.setX(controlX - 10);
+                weightLabel.setY(controlY - 20);
+                arrowHead = null;
+                reverseArrowHead = null;
+                reverseLineShape = null;
+                reverseWeightLabel = null;
+            } else if (edgeData.isCurved()) {
+                QuadCurve curve = (QuadCurve) lineShape;
+                double midX = (adjustedStartX + adjustedEndX) / 2;
+                double midY = (adjustedStartY + adjustedEndY) / 2;
+                double dx = adjustedEndX - adjustedStartX;
+                double dy = adjustedEndY - adjustedStartY;
+                double perpendicularDistance = 40;
+                double controlX = midX + perpendicularDistance * (-dy / Math.sqrt(dx * dx + dy * dy));
+                double controlY = midY + perpendicularDistance * (dx / Math.sqrt(dx * dx + dy * dy));
+                curve.setStartX(adjustedStartX);
+                curve.setStartY(adjustedStartY);
+                curve.setEndX(adjustedEndX);
+                curve.setEndY(adjustedEndY);
+                curve.setControlX(controlX);
+                curve.setControlY(controlY);
+                weightLabel.setText(String.valueOf(edgeData.getWeight()));
+                weightLabel.setX((adjustedStartX + adjustedEndX + controlX) / 3 - 10);
+                weightLabel.setY((adjustedStartY + adjustedEndY + controlY) / 3 - 10);
+                updateArrowHeadPosition(arrowHead, curve.getEndX(), curve.getEndY(), curve.getControlX(), curve.getControlY());
+                reverseArrowHead = null;
+                reverseLineShape = null;
+                reverseWeightLabel = null;
+            } else if (edgeData.isBidirectionalParallel()) {
+                Line line1 = (Line) lineShape;
+                Line line2 = (Line) reverseLineShape;
+                double offset = 8;
+                double perpendicularAngle = angle + Math.PI / 2;
+                line1.setStartX(startX + offset * Math.cos(perpendicularAngle));
+                line1.setStartY(startY + offset * Math.sin(perpendicularAngle));
+                line1.setEndX(endX + offset * Math.cos(perpendicularAngle));
+                line1.setEndY(endY + offset * Math.sin(perpendicularAngle));
+                line2.setStartX(endX - offset * Math.cos(perpendicularAngle));
+                line2.setStartY(endY - offset * Math.sin(perpendicularAngle));
+                line2.setEndX(startX - offset * Math.cos(perpendicularAngle));
+                line2.setEndY(startY - offset * Math.sin(perpendicularAngle));
+                weightLabel.setText(String.valueOf(edgeData.getWeight()));
+                weightLabel.setX((line1.getStartX() + line1.getEndX()) / 2 - 10);
+                weightLabel.setY((line1.getStartY() + line1.getEndY()) / 2 - 10);
+                Optional<EdgeGraphic> actualReverseEdgeGraphic = app.edgeGraphics.stream()
+                        .filter(eg -> eg.getEdgeData().getSourceNode() == targetNode && eg.getEdgeData().getTargetNode() == sourceNode && eg != this)
+                        .findFirst();
+                actualReverseEdgeGraphic.ifPresent(eg -> reverseWeightLabel.setText(String.valueOf(eg.getEdgeData().getWeight())));
+                if (actualReverseEdgeGraphic.isEmpty()) {
+                    reverseWeightLabel.setText("");
+                }
+                reverseWeightLabel.setX((line2.getStartX() + line2.getEndX()) / 2 - 10);
+                reverseWeightLabel.setY((line2.getStartY() + line2.getEndY()) / 2 - 10);
+                updateArrowHeadPosition(arrowHead, line1.getEndX(), line1.getEndY(), line1.getStartX(), line1.getStartY());
+                updateArrowHeadPosition(reverseArrowHead, line2.getEndX(), line2.getEndY(), line2.getStartX(), line2.getStartY());
+            } else {
+                Line line = (Line) lineShape;
+                line.setStartX(adjustedStartX);
+                line.setStartY(adjustedStartY);
+                line.setEndX(adjustedEndX);
+                line.setEndY(adjustedEndY);
+                weightLabel.setText(String.valueOf(edgeData.getWeight()));
+                weightLabel.setX((line.getStartX() + line.getEndX()) / 2 - 10);
+                weightLabel.setY((line.getStartY() + line.getEndY()) / 2 - 10);
+                updateArrowHeadPosition(arrowHead, line.getEndX(), line.getEndY(), line.getStartX(), line.getStartY());
+                if (edgeData.isBidirectionalStraight()) {
+                    updateArrowHeadPosition(reverseArrowHead, line.getStartX(), line.getStartY(), line.getEndX(), line.getEndY());
+                } else {
+                    reverseArrowHead = null;
+                }
+                reverseLineShape = null;
+                reverseWeightLabel = null;
+            }
+            if (lineShape != null) lineShape.toBack();
+            if (reverseLineShape != null) reverseLineShape.toBack();
+            if (weightLabel != null) weightLabel.toFront();
+            if (reverseWeightLabel != null) reverseWeightLabel.toFront();
+            if (arrowHead != null) arrowHead.toFront();
+            if (reverseArrowHead != null) reverseArrowHead.toFront();
+        }
+        private void updateArrowHeadPosition(Polygon arrow, double endX, double endY, double startX, double startY) {
+            if (arrow == null) return;
+            double angle = Math.atan2(endY - startY, endX - startX);
+            double arrowLength = 10;
+            double arrowWidth = 7;
+            double point1X = endX - arrowLength * Math.cos(angle - Math.PI / 6);
+            double point1Y = endY - arrowLength * Math.sin(angle - Math.PI / 6);
+            double point2X = endX - arrowLength * Math.cos(angle + Math.PI / 6);
+            double point2Y = endY - arrowLength * Math.sin(angle + Math.PI / 6);
+            arrow.getPoints().setAll(endX, endY, point1X, point1Y, point2X, point2Y);
+        }
+        private void setupEventHandlers() {
+            if (this.weightLabel != null) {
+                this.weightLabel.setOnContextMenuRequested(null);
+                this.weightLabel.setOnContextMenuRequested(e -> {
+                    new EdgeContextMenu(this).show(app.graphPane, e.getScreenX(), e.getScreenY());
+                    e.consume();
+                });
+            }
+            if (this.lineShape != null) {
+                this.lineShape.setOnContextMenuRequested(null);
+                this.lineShape.setOnContextMenuRequested(e -> {
+                    new EdgeContextMenu(this).show(app.graphPane, e.getScreenX(), e.getScreenY());
+                    e.consume();
+                });
+            }
+            if (reverseLineShape != null) {
+                this.reverseLineShape.setOnContextMenuRequested(null);
+                this.reverseLineShape.setOnContextMenuRequested(e -> {
+                    new EdgeContextMenu(this).show(app.graphPane, e.getScreenX(), e.getScreenY());
+                    e.consume();
+                });
+            }
+            if (reverseWeightLabel != null) {
+                this.reverseWeightLabel.setOnContextMenuRequested(null);
+                this.reverseWeightLabel.setOnContextMenuRequested(e -> {
+                    new EdgeContextMenu(this).show(app.graphPane, e.getScreenX(), e.getScreenY());
+                    e.consume();
+                });
+            }
+        }
+        public Shape getLineShape() { return lineShape; }
+        public Shape getReverseLineShape() { return reverseLineShape; }
+        public Text getWeightLabel() { return weightLabel; }
+        public Text getReverseWeightLabel() { return reverseWeightLabel; }
+        public Polygon getArrowHead() { return arrowHead; }
+        public Polygon getReverseArrowHead() { return reverseArrowHead; }
+    }
+    private void updateAffectedEdges(Node movedNode) {
+        for (EdgeGraphic edgeGraphic : edgeGraphics) {
+            if (edgeGraphic.getEdgeData().getSourceNode() == movedNode || edgeGraphic.getEdgeData().getTargetNode() == movedNode) {
+                edgeGraphic.updateGraphics();
+            }
+        }
+        for (Node node : nodes) {
+            node.label.toFront();
+        }
+        for (EdgeGraphic edgeGraphic : edgeGraphics) {
+            if (edgeGraphic.getWeightLabel() != null) edgeGraphic.getWeightLabel().toFront();
+            if (edgeGraphic.getReverseWeightLabel() != null) edgeGraphic.getReverseWeightLabel().toFront();
+            if (edgeGraphic.getArrowHead() != null) edgeGraphic.getArrowHead().toFront();
+            if (edgeGraphic.getReverseArrowHead() != null) edgeGraphic.getReverseArrowHead().toFront();
+        }
+    }
+    private void handleNodeSelection(Node node) {
+        if (selectedNode1 == null) {
+            selectedNode1 = node;
+            selectedNode1.setFill(Color.RED);
+        } else if (selectedNode2 == null && node != selectedNode1) {
+            selectedNode2 = node;
+            node.setFill(Color.RED);
+            promptForNewEdgeWeight(selectedNode1, selectedNode2);
+        } else {
+            resetNodeSelection();
+            selectedNode1 = node;
+            selectedNode1.setFill(Color.RED);
+        }
+    }
+    private void setupGraphPaneEventHandlers() {
+        graphPane.setOnMouseClicked(e -> {
+            if (e.getTarget() == graphPane) {
+                resetNodeSelection();
+            }
+        });
+        graphPane.setOnContextMenuRequested(e -> {
+            boolean handled = false;
+            for (Node node : nodes) {
+                double distance = node.getBoundsInParent().getCenterX() - e.getX();
+                double distanceY = node.getBoundsInParent().getCenterY() - e.getY();
+                if (Math.sqrt(distance * distance + distanceY * distanceY) <= node.getRadius()) {
+                    new NodeContextMenu(node).show(graphPane, e.getScreenX(), e.getScreenY());
+                    handled = true;
+                    break;
+                }
+            }
+            if (!handled) {
+                for (EdgeGraphic edgeGraphic : edgeGraphics) {
+                    if (edgeGraphic.getLineShape() instanceof Line) {
+                        Line line = (Line) edgeGraphic.getLineShape();
+                        if (isPointNearLine(e.getX(), e.getY(), line.getStartX(), line.getStartY(), line.getEndX(), line.getEndY())) {
+                            new EdgeContextMenu(edgeGraphic).show(graphPane, e.getScreenX(), e.getScreenY());
+                            handled = true;
+                            break;
+                        }
+                    } else if (edgeGraphic.getLineShape() instanceof QuadCurve) {
+                        QuadCurve curve = (QuadCurve) edgeGraphic.getLineShape();
+                        Point2D p = new Point2D(e.getX(), e.getY());
+                        double minDistance = Double.MAX_VALUE;
+                        for (double t = 0; t <= 1; t += 0.01) {
+                            double x = Math.pow(1 - t, 2) * curve.getStartX() + 2 * (1 - t) * t * curve.getControlX()
+                                    + Math.pow(t, 2) * curve.getEndX();
+                            double y = Math.pow(1 - t, 2) * curve.getStartY() + 2 * (1 - t) * t * curve.getControlY()
+                                    + Math.pow(t, 2) * curve.getEndY();
+                            minDistance = Math.min(minDistance, p.distance(x, y));
+                        }
+                        if (minDistance < 10) {
+                            new EdgeContextMenu(edgeGraphic).show(graphPane, e.getScreenX(), e.getScreenY());
+                            handled = true;
+                            break;
+                        }
+                    }
+                    if (edgeGraphic.getReverseLineShape() instanceof Line) {
+                        Line line = (Line) edgeGraphic.getReverseLineShape();
+                        if (isPointNearLine(e.getX(), e.getY(), line.getStartX(), line.getStartY(), line.getEndX(), line.getEndY())) {
+                            new EdgeContextMenu(edgeGraphic).show(graphPane, e.getScreenX(), e.getScreenY());
+                            handled = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            e.consume();
+        });
+    }
+    private Node addNodeInternal() {
+        nodeCounter++;
+        String nodeId = "N" + nodeCounter;
+        Node newNode = new Node(50 + (nodes.size() % 10) * 80, 50 + (nodes.size() / 10) * 80, nodeId);
+        return newNode;
+    }
+    private void promptForNodeLabel(Node node) {
+        TextInputDialog dialog = new TextInputDialog(node.id);
+        dialog.setTitle("Rotular Nó");
+        dialog.setHeaderText("Alterar rótulo do nó");
+        dialog.setContentText("Novo rótulo:");
+        Optional<String> result = dialog.showAndWait();
+        result.ifPresent(newLabel -> {
+            if (nodes.stream().anyMatch(n -> n.id.equalsIgnoreCase(newLabel) && n != node)) {
+                showAlert("Erro", "Este rótulo já está em uso. Por favor, escolha um rótulo único.");
+                return;
+            }
+            String oldLabel = node.id;
+            executeAction(new LabelNodeAction(this, node, oldLabel, newLabel));
+        });
+    }
+    private void promptForNewEdgeWeight(Node source, Node target) {
+        TextInputDialog dialog = new TextInputDialog("1");
+        dialog.setTitle("Criar Aresta");
+        dialog.setHeaderText("Digite o peso para a aresta de " + source.id + " para " + target.id);
+        dialog.setContentText("Peso:");
+        Optional<String> result = dialog.showAndWait();
+        result.ifPresent(weightStr -> {
+            try {
+                int weight = Integer.parseInt(weightStr);
+                executeAction(new AddEdgeAction(this, source, target, weight));
+            } catch (NumberFormatException e) {
+                showAlert("Erro", "Por favor, insira um número inteiro válido para o peso.");
+            } finally {
+                resetNodeSelection();
+            }
+        });
+        if (result.isEmpty()) {
+            resetNodeSelection();
+        }
+    }
+    private void addEdgeInternal(EdgeData edgeData) {
+        EdgeGraphic newEdgeGraphic = new EdgeGraphic(edgeData, this);
+        edgeGraphics.add(newEdgeGraphic);
+        newEdgeGraphic.addComponentsToPane(graphPane);
+        displayAdjacencyMatrix();
+    }
+    private void resetNodeSelection() {
+        if (selectedNode1 != null) {
+            selectedNode1.setFill(Color.BLUE);
+            selectedNode1 = null;
+        }
+        if (selectedNode2 != null) {
+            selectedNode2.setFill(Color.BLUE);
+            selectedNode2 = null;
+        }
+    }
+    private void displayAdjacencyMatrix() {
+        adjacencyMatrix.getColumns().clear();
+        adjacencyMatrix.getItems().clear();
+        if (nodes.isEmpty()) {
+            return;
+        }
+        int[][] matrix = generateAdjacencyMatrix();
+        List<String> nodeIds = nodes.stream().map(n -> n.id).collect(Collectors.toList());
+        TableColumn<Map<String, String>, String> firstColumn = new TableColumn<>("Nó");
+        firstColumn.setCellValueFactory(cellData -> new SimpleStringProperty(cellData.getValue().get("Node")));
+        adjacencyMatrix.getColumns().add(firstColumn);
+        for (String nodeId : nodeIds) {
+            TableColumn<Map<String, String>, String> column = new TableColumn<>(nodeId);
+            column.setCellValueFactory(cellData -> new SimpleStringProperty(cellData.getValue().get(nodeId)));
+            adjacencyMatrix.getColumns().add(column);
+        }
+        for (int i = 0; i < matrix.length; i++) {
+            Map<String, String> rowData = new HashMap<>();
+            rowData.put("Node", nodeIds.get(i));
+            for (int j = 0; j < matrix[i].length; j++) {
+                rowData.put(nodeIds.get(j), String.valueOf(matrix[i][j]));
+            }
+            adjacencyMatrix.getItems().add(rowData);
+        }
+    }
+    private int[][] generateAdjacencyMatrix() {
+        int size = nodes.size();
+        int[][] matrix = new int[size][size];
+        Map<String, Integer> nodeIndex = new HashMap<>();
+        for (int i = 0; i < nodes.size(); i++) {
+            nodeIndex.put(nodes.get(i).id, i);
+        }
+        for (EdgeGraphic edgeGraphic : edgeGraphics) {
+            EdgeData edge = edgeGraphic.getEdgeData();
+            Node source = edge.getSourceNode();
+            Node target = edge.getTargetNode();
+            if (nodeIndex.containsKey(source.id) && nodeIndex.containsKey(target.id)) {
+                int i = nodeIndex.get(source.id);
+                int j = nodeIndex.get(target.id);
+                matrix[i][j] = edge.getWeight();
+            }
+        }
+        return matrix;
+    }
+    private void initializeAdjacencyMatrixTable() {
+        displayAdjacencyMatrix();
+    }
+    private void promptForMatrixInput() {
+        TextInputDialog dialog = new TextInputDialog("0 1 0; 0 0 1; 1 0 0");
+        dialog.setTitle("Desenhar Grafo de Matriz");
+        dialog.setHeaderText("Insira a matriz de adjacência (ex: 0 1 0; 0 0 1; 1 0 0)");
+        dialog.setContentText("Matriz:");
+        Optional<String> result = dialog.showAndWait();
+        result.ifPresent(matrixString -> {
+            try {
+                executeAction(new DrawFromMatrixAction(this, new ArrayList<>(nodes), edgeGraphics.stream().map(EdgeGraphic::getEdgeData).collect(Collectors.toList()), nodeCounter, matrixString));
+            } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
+                showAlert("Erro", "Formato de matriz inválido. Certifique-se de usar números e separar linhas com ';' e colunas com espaço.");
+            } catch (IllegalArgumentException e) {
+                showAlert("Erro", e.getMessage());
+            }
+        });
+    }
+    private void drawGraphFromMatrixInternal(String matrixString) {
+        graphPane.getChildren().clear();
+        nodes.clear();
+        edgeGraphics.clear();
+        nodeCounter = 0;
+        String[] rows = matrixString.split(";");
+        int size = rows.length;
+        if (size == 0 || (size == 1 && rows[0].trim().isEmpty())) {
+            displayAdjacencyMatrix();
+            return;
+        }
+        int[][] matrix = new int[size][size];
+        for (int i = 0; i < size; i++) {
+            String[] cols = rows[i].trim().split(" ");
+            if (cols.length != size) {
+                throw new IllegalArgumentException("Matriz não quadrada ou formato incorreto. Certifique-se de que cada linha tenha o mesmo número de colunas.");
+            }
+            for (int j = 0; j < size; j++) {
+                matrix[i][j] = Integer.parseInt(cols[j].trim());
+            }
+        }
+        double centerX = graphPane.getWidth() / 2;
+        double centerY = graphPane.getHeight() / 2;
+        double radius = Math.min(centerX, centerY) * 0.35;
+        for (int i = 0; i < size; i++) {
+            nodeCounter++;
+            double x = centerX + radius * Math.cos(2 * Math.PI * i / size);
+            double y = centerY + radius * Math.sin(2 * Math.PI * i / size);
+            Node newNode = new Node(x, y, "N" + nodeCounter);
+            nodes.add(newNode);
+            graphPane.getChildren().addAll(newNode, newNode.label);
+        }
+        Set<String> processedEdges = new HashSet<>();
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++) {
+                if (matrix[i][j] != 0) {
+                    Node source = nodes.get(i);
+                    Node target = nodes.get(j);
+                    int weight = matrix[i][j];
+                    String forwardEdgeKey = source.id + "->" + target.id;
+                    String reverseEdgeKey = target.id + "->" + source.id;
+                    if (processedEdges.contains(forwardEdgeKey) || processedEdges.contains(reverseEdgeKey)) {
+                        continue;
+                    }
+                    if (source == target) {
+                        EdgeData newEdgeData = new EdgeData(source, target, weight, true, false, false);
+                        EdgeGraphic newEdgeGraphic = new EdgeGraphic(newEdgeData, this);
+                        edgeGraphics.add(newEdgeGraphic);
+                        newEdgeGraphic.addComponentsToPane(graphPane);
+                    } else if (matrix[j][i] != 0) {
+                        if (matrix[j][i] == weight) {
+                            EdgeData newEdgeData = new EdgeData(source, target, weight, false, true, false);
+                            EdgeGraphic newEdgeGraphic = new EdgeGraphic(newEdgeData, this);
+                            edgeGraphics.add(newEdgeGraphic);
+                            newEdgeGraphic.addComponentsToPane(graphPane);
+                        } else {
+                            EdgeData edge1Data = new EdgeData(source, target, weight, false, false, true);
+                            EdgeGraphic edge1Graphic = new EdgeGraphic(edge1Data, this);
+                            EdgeData edge2Data = new EdgeData(target, source, matrix[j][i], false, false, true);
+                            EdgeGraphic edge2Graphic = new EdgeGraphic(edge2Data, this);
+                            edgeGraphics.add(edge1Graphic);
+                            edgeGraphics.add(edge2Graphic);
+                            edge1Graphic.addComponentsToPane(graphPane);
+                            edge2Graphic.addComponentsToPane(graphPane);
+                        }
+                        processedEdges.add(forwardEdgeKey);
+                        processedEdges.add(reverseEdgeKey);
+                    } else {
+                        EdgeData newEdgeData = new EdgeData(source, target, weight, false, false, false);
+                        EdgeGraphic newEdgeGraphic = new EdgeGraphic(newEdgeData, this);
+                        edgeGraphics.add(newEdgeGraphic);
+                        newEdgeGraphic.addComponentsToPane(graphPane);
+                    }
+                }
+            }
+        }
+        for(Node node : nodes) {
+            node.label.toFront();
+        }
+        for(EdgeGraphic edgeGraphic : edgeGraphics) {
+            edgeGraphic.updateGraphics();
+            if(edgeGraphic.getWeightLabel() != null) edgeGraphic.getWeightLabel().toFront();
+            if(edgeGraphic.getReverseWeightLabel() != null) edgeGraphic.getReverseWeightLabel().toFront();
+            if(edgeGraphic.getArrowHead() != null) edgeGraphic.getArrowHead().toFront();
+            if(edgeGraphic.getReverseArrowHead() != null) edgeGraphic.getReverseArrowHead().toFront();
+        }
+        displayAdjacencyMatrix();
+    }
+    private void findPathsOptionsPrompt() {
+        ChoiceDialog<String> choiceDialog = new ChoiceDialog<>("Todas as Rotas", "Todas as Rotas", "Rota Mais Curta",
+                "Rota Mais Longa");
+        choiceDialog.setTitle("Opções de Caminho");
+        choiceDialog.setHeaderText("Selecione o tipo de busca de caminho:");
+        choiceDialog.setContentText("Tipo:");
+        Optional<String> choiceResult = choiceDialog.showAndWait();
+        choiceResult.ifPresent(choice -> {
+            TextInputDialog inputDialog = new TextInputDialog();
+            inputDialog.setTitle("Encontrar Caminhos");
+            inputDialog.setHeaderText("Insira os IDs dos nós de origem e destino (ex: N1,N4)");
+            inputDialog.setContentText("Origem,Destino:");
+            Optional<String> inputResult = inputDialog.showAndWait();
+            inputResult.ifPresent(input -> {
+                String[] parts = input.split(",");
+                if (parts.length == 2) {
+                    String startNodeId = parts[0].trim();
+                    String endNodeId = parts[1].trim();
+                    if (choice.equals("Todas as Rotas")) {
+                        List<List<String>> paths = findAllPaths(startNodeId, endNodeId);
+                        StringBuilder sb = new StringBuilder(
+                                "Caminhos encontrados de " + startNodeId + " para " + endNodeId + ":\n");
+                        if (paths.isEmpty()) {
+                            sb.append("Nenhum caminho encontrado.");
+                        } else {
+                            for (List<String> path : paths) {
+                                sb.append(String.join(" -> ", path)).append("\n");
+                            }
+                        }
+                        showAlert("Resultados dos Caminhos", sb.toString());
+                    } else if (choice.equals("Rota Mais Curta")) {
+                        findShortestPath(startNodeId, endNodeId);
+                    } else if (choice.equals("Rota Mais Longa")) {
+                        findLongestPath(startNodeId, endNodeId);
+                    }
+                } else {
+                    showAlert("Erro", "Formato inválido. Use: Origem,Destino");
+                }
+            });
+        });
+    }
+    private List<List<String>> findAllPaths(String start, String end) {
+        List<List<String>> paths = new ArrayList<>();
+        List<String> currentPath = new ArrayList<>();
+        Node startNode = nodes.stream().filter(n -> n.id.equalsIgnoreCase(start)).findFirst().orElse(null);
+        Node endNode = nodes.stream().filter(n -> n.id.equalsIgnoreCase(end)).findFirst().orElse(null);
+        if (startNode != null && endNode != null) {
+            findAllPathsDFS(startNode, endNode, new HashSet<>(), currentPath, paths);
+        }
+        return paths;
+    }
+    private void findAllPathsDFS(Node current, Node end, Set<String> visited, List<String> currentPath,
+                                 List<List<String>> paths) {
+        Set<String> newVisited = new HashSet<>(visited);
+        if (newVisited.contains(current.id)) {
+            return;
+        }
+        newVisited.add(current.id);
+        currentPath.add(current.id);
+        if (current.id.equals(end.id)) {
+            paths.add(new ArrayList<>(currentPath));
+        } else {
+            for (EdgeGraphic edgeGraphic : edgeGraphics) {
+                EdgeData edge = edgeGraphic.getEdgeData();
+                if (edge.getSourceNode() == current) {
+                    Node neighbor = edge.getTargetNode();
+                    findAllPathsDFS(neighbor, end, newVisited, currentPath, paths);
+                }
+            }
+        }
+        currentPath.remove(currentPath.size() - 1);
+        newVisited.remove(current.id);
+    }
+    private void findShortestPath(String startId, String endId) {
+        Node startNode = nodes.stream().filter(n -> n.id.equalsIgnoreCase(startId)).findFirst().orElse(null);
+        Node endNode = nodes.stream().filter(n -> n.id.equalsIgnoreCase(endId)).findFirst().orElse(null);
+        if (startNode == null || endNode == null) {
+            showAlert("Erro", "Nós de origem ou destino não encontrados.");
+            return;
+        }
+        Map<Node, Integer> distances = new HashMap<>();
+        Map<Node, Node> predecessors = new HashMap<>();
+        PriorityQueue<Node> pq = new PriorityQueue<>(Comparator.comparingInt(distances::get));
+        for (Node node : nodes) {
+            distances.put(node, Integer.MAX_VALUE);
+        }
+        distances.put(startNode, 0);
+        pq.add(startNode);
+        while (!pq.isEmpty()) {
+            Node current = pq.poll();
+            for (EdgeGraphic edgeGraphic : edgeGraphics) {
+                EdgeData edge = edgeGraphic.getEdgeData();
+                if (edge.getSourceNode() == current) {
+                    Node neighbor = edge.getTargetNode();
